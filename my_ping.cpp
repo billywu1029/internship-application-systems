@@ -13,10 +13,15 @@
 #include <thread>
 
 /*
+ * Compile: g++ my_ping.cpp -o my_ping -std=c++11
+ * Run: sudo ./my_ping www.google.com
+ * 
  * NOTE: Must compile and then run as superuser, ie g++ my_ping.cpp, followed by sudo ./my_ping www.google.com
  * This is for the raw socket with the ICMP protocol to be able to run. Due to linux security vulnerabilities
- * (see: http://squidarth.com/networking/systems/rc/2018/05/28/using-raw-sockets.html),
+ * (see http://squidarth.com/networking/systems/rc/2018/05/28/using-raw-sockets.html),
  * you can't make a raw socket without superuser privileges.
+ *
+ * NOTE: Reverse DNS lookup sometimes doesn't work. Try again if it shows <Unknown> as the reverse looked up hostname.
  *
  * Author: Bill Wu
  * Date: 4/20/20
@@ -99,64 +104,128 @@ string process_target(const char* target) {
     }
 }
 
-short checksum(short* pkt_blocks, int num_blocks) {
+int32_t checksum(uint16_t* pkt_blocks, int num_blocks) {
     // Adds together every 16-bit block from header + data, then return the ones-compliment of the sum
-    int sum = 0;
-    short *block = pkt_blocks;
-    for (int i = 0; i < num_blocks; i++) {
-        sum += *block;
-        block++;
-    }
-    return (short) ~sum;  // Flip the bits of sum for ones-compliment
+    // Borrowed from: https://stackoverflow.com/questions/9913661/what-is-the-proper-process-for-icmp-echo-request-reply-on-unreachable-destinatio
+    int32_t sum = 0;
+    uint16_t *w = pkt_blocks;
+    uint16_t answer = 0;
 
+    while(num_blocks > 1) {
+        sum += *w++;
+        num_blocks -= 2;
+    }
+
+    if (num_blocks == 1) {
+        *(uint16_t *)(&answer) = *(uint8_t *)w;
+        sum += answer;
+    }
+
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    answer = ~sum;
+
+    return answer;
 }
 
-// For now, just pass in arguments via arg parser, later can switch to CLI
-// that uses arg flags.
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        cerr << "Usage: " << argv[0] << " <HOSTNAME or IP_ADDR>" << endl;
-        return 1;  // Improper formatting, exit with error
+string reverse_dns_lookup(const char *ip_addr) {
+    struct sockaddr_in temp_addr{};
+    char buf[NI_MAXHOST];
+
+    temp_addr.sin_family = AF_INET;
+    temp_addr.sin_addr.s_addr = inet_addr(ip_addr);
+
+    if (getnameinfo((struct sockaddr *) &temp_addr, sizeof(struct sockaddr_in), buf, sizeof(buf),
+                    nullptr, 0, NI_NAMEREQD)) {
+        cout << "Could not resolve reverse lookup of hostname!" << endl;
+        return "<Unknown>";
     }
+    return buf;
+}
 
-    cout << argc << " args: " << argv[0] << ", " << argv[1] << endl;
+void send_pkts(int socket_fd, const string& target, const string& target_reverse_lookup) {
+    sockaddr_in address{};  // Initialize address struct
+    memset(&address, 0, sizeof(address));  // Clear address struct
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = inet_addr(target.c_str());
 
+    while (true) {
+        cout << "sending packet #" << total_pkts << endl;
+        char packet[sizeof(icmphdr)];
+        // Setting everything to 0, implies that checksum zeroed out, code=0, id=0.
+        memset(packet, 0, sizeof(packet));
 
-    // Convert hostname to equivalent IP address if needed
-    string target;
-    if (is_ip_addr(argv[1])) {
-        target = argv[1];
+        auto *req_pkt = (icmphdr *) packet;
+        req_pkt->type = ICMP_ECHO;
+        req_pkt->un.echo.sequence = total_pkts;
+        req_pkt->checksum = checksum((uint16_t *) req_pkt, sizeof(packet));
+
+        // Handle potential error cases/edge cases of packets not being sent properly after this call
+        sendto(socket_fd, packet, sizeof(packet), 0, (sockaddr *) &address, sizeof(sockaddr_in));
+
+        // Immediately start the counter after sending the packet.
+        // Using a time-based approach to measure RTT here.
+        // More correct/difficult is: read timestamp from reply's data bytes and then - start time.
+        auto start = chrono::system_clock::now();
+
+        // Wait for echo reply from OS buffer
+        while (true) {
+            char inbuf[192];
+            memset(inbuf, 0, sizeof(inbuf));
+            int addrlen = sizeof(sockaddr_in);
+
+            // Immediately record time after receiving echo reply. recvfrom() itself is a blocking call
+            int bytes = recvfrom(socket_fd, inbuf, sizeof(inbuf), 0, (sockaddr *) &address, (socklen_t *) &addrlen);
+            auto end_time = chrono::system_clock::now();
+
+            // Verify that reply bytes were valid
+            if (bytes < sizeof(iphdr) + sizeof(icmphdr)) {
+                cout << "Incorrect read bytes!" << endl;
+                continue;
+            }
+
+            // Construct reply packet from buffer
+            auto *iph = (iphdr *) inbuf;
+            int hlen = (iph->ihl << 2);
+            auto reply_pkt = (icmphdr *)(inbuf + hlen);
+            int id = ntohs(reply_pkt->un.echo.id);
+
+            if (reply_pkt->type == ICMP_ECHOREPLY) {
+                // Ensure that ID matches && checksum from request was 8 more than reply's checksum
+                // (since the type for an ECHO_REPLY = 0 and ECHO_REQ = 8, and bits are flipped in checksum calculation)
+                // Update: for some reason the int16_t overflow makes it so that the first reply checksum = 0 != 65535
+                // Just keep the checksum assertion here for future reference, if I figure out this issue:
+                // if (id == ICMP_HDR_ID && req_pkt->checksum + 8) {
+                if (id == ICMP_HDR_ID ) {
+                    auto elapsed_time = end_time - start;
+                    int elapsed_ms = chrono::duration_cast<chrono::milliseconds>(elapsed_time).count();
+                    if (elapsed_ms > max_rtt) {
+                        max_rtt = elapsed_ms;
+                    }
+                    if (elapsed_ms < min_rtt) {
+                        min_rtt = elapsed_ms;
+                    }
+                    sum_rtt += elapsed_ms;
+                    recv_pkts++;
+                    cout << PING_PACKET_BYTES << " bytes from " << target_reverse_lookup << " (" << target << "): "
+                         << "icmp_seq=" << total_pkts << ", elapsed_time=" << elapsed_ms << " ms" << endl;
+                    cout << "\n" << endl;
+                    break;
+                }
+            } else if (reply_pkt->type == ICMP_DEST_UNREACH) {
+                cout << "From " << target << " icmp_seq=" << total_pkts << " Destination Host Unreachable" << endl;
+                break;
+            } else {
+                cout << "Error, unhandled ICMP protocol response: " << reply_pkt->type << endl;
+                break;
+            }
+        }
+
+        total_pkts++;
+        chrono::milliseconds timespan(PING_REQ_INTERVAL_MS);
+        this_thread::sleep_for(timespan);
     }
-    else if (is_hostname(argv[1])) {
-        target = get_hostname_addr(argv[1]);
-    }
-    else {
-        cout << "Invalid input" << endl;
-        return 1;
-    }
-
-//    struct sockaddr_in address{};  // Initialize address struct
-//    memset(&address, 0, sizeof(address));  // Clear address struct
-//    address.sin_family = AF_INET;
-//    address.sin_addr.s_addr = inet_addr(target);
-
-    // Open the socket, need to connect to target IP addr
-    // Need superuser priviledges for raw sockets. Workaround:
-    // https://stackoverflow.com/questions/28857941/opening-raw-sockets-in-linux-without-being-superuser
-    int socket_fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (socket_fd < 0) {
-        perror("socket");
-        return 1;
-    }
-
-    cout << socket_fd << endl;
-
-    struct icmphdr icmp_hdr{};
-    // Besides zeroing out all header bits, sets code and sequence number to 0 as well:
-    memset(&icmp_hdr, 0, sizeof icmp_hdr);
-    icmp_hdr.type = ICMP_ECHO;
-    icmp_hdr.un.echo.id = 6829;  // in the spirit of 6.829, Networking
-
+}
 
 // For now, just pass in arguments via arg parser, later can switch to CLI
 // that uses arg flags.
@@ -200,6 +269,7 @@ int main(int argc, char* argv[]) {
     // Note: If no internet connection, behavior is the same as original ping, DNS lookup fails for input hostnames
     string target = process_target(argv[1]);
     const char* target_cstr = target.c_str();
+    string reverse_lookup_target = reverse_dns_lookup(target_cstr);
 
     // Open the socket, need to connect to target IP addr
     // Need superuser priviledges for raw sockets. Workaround:
@@ -212,6 +282,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Send the actual packets in an infinite loop, while recording statistics
+    send_pkts(socket_fd, target_cstr, reverse_lookup_target);
 
     return 0;
 }
